@@ -1,0 +1,97 @@
+name: DevSecOps Pipeline
+
+on:
+  push:
+    branches: [ feature/* ]
+  pull_request:
+    branches: [ feature/* ]
+
+jobs:
+
+  # ── Stage 1: Secrets Detection ──────────────────────────────
+  secrets-scan:
+    name: Secrets Detection (GitLeaks)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # full history so GitLeaks scans all commits
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ── Stage 2: SAST ────────────────────────────────────────────
+  sast:
+    name: SAST (Semgrep)
+    runs-on: windows-latest
+    needs: secrets-scan
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/javascript
+            p/nodejs
+            p/owasp-top-ten
+        continue-on-error: true   # won't block pipeline, but logs findings
+
+  # ── Stage 3: Dependency Scanning ─────────────────────────────
+  dependency-scan:
+    name: Dependency Scan (Snyk)
+    runs-on: windows-latest
+    needs: secrets-scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - run: npm install --ignore-scripts
+      - name: Run Snyk
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # ── Stage 4: Build Docker Image ───────────────────────────────
+  build:
+    name: Build Docker Image
+    runs-on: windows-latest
+    needs: [sast, dependency-scan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t juice-shop:${{ github.sha }} .
+
+      - name: Save image as tar
+        run: docker save juice-shop:${{ github.sha }} -o juice-shop.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: juice-shop.tar
+
+  # ── Stage 5: Container Scanning ───────────────────────────────
+  container-scan:
+    name: Container Scan (Trivy)
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: docker load -i juice-shop.tar
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: juice-shop:${{ github.sha }}
+          format: table
+          exit-code: '0'           # set to '1' to fail on critical CVEs
+          severity: CRITICAL,HIGH
