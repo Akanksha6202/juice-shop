@@ -140,10 +140,6 @@ jobs:
     needs: unit-test
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: npm install --ignore-scripts
       - name: Run OWASP Dependency-Check
         uses: dependency-check/Dependency-Check_Action@main
         continue-on-error: true
@@ -168,8 +164,6 @@ jobs:
     needs: unit-test
     steps:
       - uses: actions/checkout@v4
-      - name: Create reports directory
-        run: mkdir -p reports
       - name: Run Checkov
         uses: bridgecrewio/checkov-action@master
         continue-on-error: true
@@ -177,8 +171,20 @@ jobs:
           directory: .
           framework: dockerfile,github_actions,secrets
           output_format: json
-          output_file_path: reports/checkov-report.json
+          output_file_path: results_json.json
           soft_fail: true
+      - name: Collect Checkov report
+        if: always()
+        run: |
+          mkdir -p reports
+          # checkov-action writes results_json.json or results_json/ depending on version
+          if [ -f results_json.json ]; then
+            cp results_json.json reports/checkov-report.json
+          elif [ -f results_json/results_json.json ]; then
+            cp results_json/results_json.json reports/checkov-report.json
+          else
+            echo '{}' > reports/checkov-report.json
+          fi
       - name: Upload Checkov report
         uses: actions/upload-artifact@v4
         if: always()
@@ -350,7 +356,7 @@ jobs:
         continue-on-error: true
         with:
           name: checkov-report
-          path: reports/
+          path: reports/checkov/
 
       - name: Download Trivy report
         uses: actions/download-artifact@v4
@@ -450,13 +456,17 @@ jobs:
             lines.append("_Not available._")
 
           lines += ["\n---\n", "## Checkov IaC Findings\n"]
-          data = load_json("reports/checkov-report.json")
+          data = load_json("reports/checkov/checkov-report.json")
           if data:
-            results = data.get("results", {})
-            failed = results.get("failed_checks", [])
-            passed = results.get("passed_checks", [])
-            lines.append(f"Passed: {len(passed)} | Failed: {len(failed)}\n")
-            for c in failed[:20]:
+            # Checkov outputs a list when multiple frameworks run, or a single dict
+            entries = data if isinstance(data, list) else [data]
+            all_failed, all_passed = [], []
+            for entry in entries:
+              r = entry.get("results", {})
+              all_failed += r.get("failed_checks", [])
+              all_passed += r.get("passed_checks", [])
+            lines.append(f"Passed: {len(all_passed)} | Failed: {len(all_failed)}\n")
+            for c in all_failed[:20]:
               lines.append(f"- [{c.get('check_id','')}] {c.get('check_type','')} ({c.get('repo_file_path','')})")
           else:
             lines.append("_Not available._")
