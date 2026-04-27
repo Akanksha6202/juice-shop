@@ -21,11 +21,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Stage 2: SAST ────────────────────────────────────────────
+  # ── Stage 2: Unit Tests ──────────────────────────────────────
+  test:
+    name: Server Unit Tests
+    runs-on: ubuntu-latest
+    needs: secrets-scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: npm run test:server
+
+  # ── Stage 3: SAST ────────────────────────────────────────────
   sast:
     name: SAST (Semgrep)
-    runs-on: windows-latest
-    needs: secrets-scan
+    runs-on: ubuntu-latest
+    needs: test
     steps:
       - uses: actions/checkout@v4
       - name: Run Semgrep
@@ -40,8 +53,8 @@ jobs:
   # ── Stage 3: Dependency Scanning ─────────────────────────────
   dependency-scan:
     name: Dependency Scan (Snyk)
-    runs-on: windows-latest
-    needs: secrets-scan
+    runs-on: ubuntu-latest
+    needs: test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -53,6 +66,15 @@ jobs:
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --json-file-output=snyk-report.json
+
+      - name: Upload Snyk report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-report
+          path: snyk-report.json
 
   # ── Stage 4: Build Docker Image ───────────────────────────────
   build:
@@ -92,6 +114,110 @@ jobs:
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: juice-shop:${{ github.sha }}
-          format: table
+          format: json
+          output: trivy-report.json
           exit-code: '0'           # set to '1' to fail on critical CVEs
           severity: CRITICAL,HIGH
+
+      - name: Upload Trivy report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-report
+          path: trivy-report.json
+
+  # ── Stage 6: Publish PDF Report ───────────────────────────────
+  publish-report:
+    name: Publish PDF Security Report
+    runs-on: ubuntu-latest
+    needs: [test, sast, dependency-scan, container-scan]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Snyk report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: snyk-report
+          path: reports/
+
+      - name: Download Trivy report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: trivy-report
+          path: reports/
+
+      - name: Generate Markdown report
+        run: |
+          cat <<'EOF' > reports/security-report.md
+          # DevSecOps Security Report
+
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.ref_name }}
+          **Commit:** ${{ github.sha }}
+          **Run:** ${{ github.run_number }}
+          **Date:** $(date -u '+%Y-%m-%d %H:%M UTC')
+
+          ---
+
+          ## Stage Results
+
+          | Stage | Status |
+          |-------|--------|
+          | Secrets Detection (GitLeaks) | ${{ needs.secrets-scan.result }} |
+          | Server Unit Tests | ${{ needs.test.result }} |
+          | SAST (Semgrep) | ${{ needs.sast.result }} |
+          | Dependency Scan (Snyk) | ${{ needs.dependency-scan.result }} |
+          | Container Scan (Trivy) | ${{ needs.container-scan.result }} |
+
+          ---
+
+          ## Snyk Dependency Findings
+
+          EOF
+          if [ -f reports/snyk-report.json ]; then
+            echo '```json' >> reports/security-report.md
+            cat reports/snyk-report.json | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+vulns=data.get('vulnerabilities',[])
+print(f'Total vulnerabilities: {len(vulns)}')
+for v in vulns[:20]:
+    print(f'- [{v.get(\"severity\",\"\").upper()}] {v.get(\"title\",\"\")} ({v.get(\"packageName\",\"\")}@{v.get(\"version\",\"\")})')
+" 2>/dev/null || echo 'No Snyk report available'
+            echo '```' >> reports/security-report.md
+          else
+            echo '_Snyk report not available._' >> reports/security-report.md
+          fi
+
+          echo -e '\n---\n\n## Trivy Container Findings\n' >> reports/security-report.md
+          if [ -f reports/trivy-report.json ]; then
+            echo '```' >> reports/security-report.md
+            cat reports/trivy-report.json | python3 -c "
+import json,sys
+data=json.load(sys.stdin)
+results=data.get('Results',[])
+total=sum(len(r.get('Vulnerabilities') or []) for r in results)
+print(f'Total vulnerabilities: {total}')
+for r in results:
+    for v in (r.get('Vulnerabilities') or [])[:20]:
+        print(f'- [{v.get(\"Severity\",\"\")}] {v.get(\"VulnerabilityID\",\"\")} in {v.get(\"PkgName\",\"\")}@{v.get(\"InstalledVersion\",\"\")}')
+" 2>/dev/null || echo 'No Trivy report available'
+            echo '```' >> reports/security-report.md
+          else
+            echo '_Trivy report not available._' >> reports/security-report.md
+          fi
+
+      - name: Install mdpdf
+        run: npm install -g mdpdf
+
+      - name: Convert Markdown to PDF
+        run: mdpdf reports/security-report.md reports/security-report.pdf
+
+      - name: Upload PDF report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report-pdf
+          path: reports/security-report.pdf
