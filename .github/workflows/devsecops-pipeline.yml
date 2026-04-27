@@ -1,4 +1,4 @@
-name: DevSecOps Pipeline
+﻿name: DevSecOps Pipeline
 
 on:
   push:
@@ -7,24 +7,50 @@ on:
     branches: [ feature/* ]
   workflow_dispatch:   # allows manual trigger from GitHub Actions tab
 
+# ============================================================
+#  PIPELINE PHASES
+#
+#  PRE-BUILD SECURITY
+#    ├── secrets-scan     GitLeaks   — scan git history for secrets
+#    ├── unit-test        Mocha/nyc  — server unit tests
+#    ├── sast-semgrep     Semgrep    — source code security scan
+#    ├── sast-codeql      CodeQL     — deep dataflow analysis
+#    ├── dependency-snyk  Snyk       — known CVEs in packages
+#    ├── dependency-owasp OWASP DC   — NVD-based dependency check
+#    └── iac-checkov      Checkov    — Dockerfile/GHA/config scan
+#
+#  BUILD
+#    └── build            Docker     — build and archive image
+#
+#  POST-BUILD SECURITY
+#    ├── image-dockle     Dockle     — CIS benchmark image lint
+#    ├── image-trivy      Trivy      — CVE scan on image
+#    └── dast-zap         OWASP ZAP  — live app attack scan
+#
+#  REPORT
+#    └── publish-report             — aggregate PDF report
+# ============================================================
+
 jobs:
 
-  # ── Stage 1: Secrets Detection ──────────────────────────────
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║              PHASE 1 — PRE-BUILD SECURITY               ║
+  # ╚══════════════════════════════════════════════════════════╝
+
   secrets-scan:
-    name: Secrets Detection (GitLeaks)
+    name: "[Pre-Build] Secrets Detection (GitLeaks)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0       # full history so GitLeaks scans all commits
+          fetch-depth: 0
       - name: Run GitLeaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # ── Stage 2: Unit Tests ──────────────────────────────────────
-  test:
-    name: Server Unit Tests
+  unit-test:
+    name: "[Pre-Build] Unit Tests (Mocha)"
     runs-on: ubuntu-latest
     needs: secrets-scan
     steps:
@@ -35,11 +61,10 @@ jobs:
       - run: npm install
       - run: npm run test:server
 
-  # ── Stage 3: SAST ────────────────────────────────────────────
-  sast:
-    name: SAST (Semgrep)
+  sast-semgrep:
+    name: "[Pre-Build] SAST (Semgrep)"
     runs-on: ubuntu-latest
-    needs: test
+    needs: unit-test
     steps:
       - uses: actions/checkout@v4
       - name: Run Semgrep
@@ -49,18 +74,39 @@ jobs:
             p/javascript
             p/nodejs
             p/owasp-top-ten
-        continue-on-error: true   # won't block pipeline, but logs findings
+        continue-on-error: true
 
-  # ── Stage 3: Dependency Scanning ─────────────────────────────
-  dependency-scan:
-    name: Dependency Scan (Snyk)
+  sast-codeql:
+    name: "[Pre-Build] SAST (CodeQL)"
     runs-on: ubuntu-latest
-    needs: test
+    needs: unit-test
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-and-quality
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:javascript-typescript
+
+  dependency-snyk:
+    name: "[Pre-Build] Dependency Scan (Snyk)"
+    runs-on: ubuntu-latest
+    needs: unit-test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '22'
       - run: npm install --ignore-scripts
       - name: Run Snyk
         uses: snyk/actions/node@master
@@ -69,7 +115,6 @@ jobs:
           args: --json-file-output=snyk-report.json
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
       - name: Upload Snyk report
         uses: actions/upload-artifact@v4
         if: always()
@@ -77,28 +122,78 @@ jobs:
           name: snyk-report
           path: snyk-report.json
 
-  # ── Stage 4: Build Docker Image ───────────────────────────────
-  build:
-    name: Build Docker Image
+  dependency-owasp:
+    name: "[Pre-Build] Dependency Scan (OWASP)"
     runs-on: ubuntu-latest
-    needs: [sast, dependency-scan]
+    needs: unit-test
     steps:
       - uses: actions/checkout@v4
-      - name: Build image
-        run: docker build -t juice-shop:${{ github.sha }} .
+      - name: Run OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@main
+        continue-on-error: true
+        with:
+          project: juice-shop
+          path: .
+          format: JSON
+          out: reports/
+          args: >
+            --enableRetired
+            --enableExperimental
+      - name: Upload OWASP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-report
+          path: reports/dependency-check-report.json
 
+  iac-checkov:
+    name: "[Pre-Build] IaC Scan (Checkov)"
+    runs-on: ubuntu-latest
+    needs: unit-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        continue-on-error: true
+        with:
+          directory: .
+          framework: dockerfile,github_actions,secrets
+          output_format: json
+          output_file_path: reports/checkov-report.json
+          soft_fail: true
+      - name: Upload Checkov report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checkov-report
+          path: reports/checkov-report.json
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║                   PHASE 2 — BUILD                       ║
+  # ╚══════════════════════════════════════════════════════════╝
+
+  build:
+    name: "[Build] Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: [sast-semgrep, sast-codeql, dependency-snyk, dependency-owasp, iac-checkov]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t juice-shop:${{ github.sha }} .
       - name: Save image as tar
         run: docker save juice-shop:${{ github.sha }} -o juice-shop.tar
-
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
           name: docker-image
           path: juice-shop.tar
 
-  # ── Stage 5: Container Scanning ───────────────────────────────
-  container-scan:
-    name: Container Scan (Trivy)
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║            PHASE 3 — POST-BUILD SECURITY                ║
+  # ╚══════════════════════════════════════════════════════════╝
+
+  image-dockle:
+    name: "[Post-Build] Image Lint (Dockle)"
     runs-on: ubuntu-latest
     needs: build
     steps:
@@ -107,19 +202,49 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: docker-image
-
       - name: Load Docker image
         run: docker load -i juice-shop.tar
+      - name: Run Dockle
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/goodwithtech/dockle/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          curl -L -o dockle.tar.gz "https://github.com/goodwithtech/dockle/releases/download/v${VERSION}/dockle_${VERSION}_Linux-64bit.tar.gz"
+          tar -xzf dockle.tar.gz dockle
+          ./dockle --exit-code 0 --format json juice-shop:${{ github.sha }} > dockle-report.json || true
+      - name: Upload Dockle report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dockle-report
+          path: dockle-report.json
 
-      - name: Run Trivy vulnerability scanner
+  image-trivy:
+    name: "[Post-Build] Container Scan (Trivy)"
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+      - name: Load Docker image
+        run: docker load -i juice-shop.tar
+      - name: Trivy image scan
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: juice-shop:${{ github.sha }}
           format: json
           output: trivy-report.json
-          exit-code: '0'           # set to '1' to fail on critical CVEs
+          exit-code: '0'
           severity: CRITICAL,HIGH
-
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: config
+          scan-ref: .
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
       - name: Upload Trivy report
         uses: actions/upload-artifact@v4
         if: always()
@@ -127,11 +252,52 @@ jobs:
           name: trivy-report
           path: trivy-report.json
 
-  # ── Stage 6: Publish PDF Report ───────────────────────────────
-  publish-report:
-    name: Publish PDF Security Report
+  dast-zap:
+    name: "[Post-Build] DAST (OWASP ZAP)"
     runs-on: ubuntu-latest
-    needs: [secrets-scan, test, sast, dependency-scan, build, container-scan]
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+      - name: Load and start app
+        run: |
+          docker load -i juice-shop.tar
+          docker run -d --name juice-shop -p 3000:3000 juice-shop:${{ github.sha }}
+          echo "Waiting for app to be ready..."
+          timeout 120 bash -c 'until curl -sf http://localhost:3000; do sleep 3; done'
+      - name: Run OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: http://localhost:3000
+          cmd_options: '-a -j'
+          fail_action: false
+          artifact_name: zap-report
+      - name: Stop app container
+        if: always()
+        run: docker stop juice-shop && docker rm juice-shop
+
+  # ╔══════════════════════════════════════════════════════════╗
+  # ║                  PHASE 4 — REPORT                       ║
+  # ╚══════════════════════════════════════════════════════════╝
+
+  publish-report:
+    name: "[Report] Publish PDF Security Report"
+    runs-on: ubuntu-latest
+    needs:
+      - secrets-scan
+      - unit-test
+      - sast-semgrep
+      - sast-codeql
+      - dependency-snyk
+      - dependency-owasp
+      - iac-checkov
+      - build
+      - image-dockle
+      - image-trivy
+      - dast-zap
     if: always()
     steps:
       - uses: actions/checkout@v4
@@ -143,11 +309,32 @@ jobs:
           name: snyk-report
           path: reports/
 
+      - name: Download OWASP report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: owasp-report
+          path: reports/
+
+      - name: Download Checkov report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: checkov-report
+          path: reports/
+
       - name: Download Trivy report
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
           name: trivy-report
+          path: reports/
+
+      - name: Download Dockle report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: dockle-report
           path: reports/
 
       - name: Generate Markdown report
@@ -156,63 +343,116 @@ jobs:
           BRANCH: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
           RUN_NUM: ${{ github.run_number }}
-          RESULT_SECRETS: ${{ needs.secrets-scan.result }}
-          RESULT_TEST: ${{ needs.test.result }}
-          RESULT_SAST: ${{ needs.sast.result }}
-          RESULT_SNYK: ${{ needs.dependency-scan.result }}
-          RESULT_BUILD: ${{ needs.build.result }}
-          RESULT_TRIVY: ${{ needs.container-scan.result }}
+          R_SECRETS:  ${{ needs.secrets-scan.result }}
+          R_TEST:     ${{ needs.unit-test.result }}
+          R_SEMGREP:  ${{ needs.sast-semgrep.result }}
+          R_CODEQL:   ${{ needs.sast-codeql.result }}
+          R_SNYK:     ${{ needs.dependency-snyk.result }}
+          R_OWASP:    ${{ needs.dependency-owasp.result }}
+          R_CHECKOV:  ${{ needs.iac-checkov.result }}
+          R_BUILD:    ${{ needs.build.result }}
+          R_DOCKLE:   ${{ needs.image-dockle.result }}
+          R_TRIVY:    ${{ needs.image-trivy.result }}
+          R_ZAP:      ${{ needs.dast-zap.result }}
         run: |
           python3 - <<'PYEOF'
           import os, json, datetime
 
+          e = os.environ
           date = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
           lines = [
             "# DevSecOps Security Report\n",
-            f"**Repository:** {os.environ['REPO']}  ",
-            f"**Branch:** {os.environ['BRANCH']}  ",
-            f"**Commit:** {os.environ['COMMIT']}  ",
-            f"**Run:** {os.environ['RUN_NUM']}  ",
+            f"**Repository:** {e['REPO']}  ",
+            f"**Branch:** {e['BRANCH']}  ",
+            f"**Commit:** {e['COMMIT']}  ",
+            f"**Run:** {e['RUN_NUM']}  ",
             f"**Date:** {date}  ",
             "\n---\n",
-            "## Stage Results\n",
-            "| Stage | Status |",
-            "|-------|--------|",
-            f"| Secrets Detection (GitLeaks) | {os.environ['RESULT_SECRETS']} |",
-            f"| Server Unit Tests | {os.environ['RESULT_TEST']} |",
-            f"| SAST (Semgrep) | {os.environ['RESULT_SAST']} |",
-            f"| Dependency Scan (Snyk) | {os.environ['RESULT_SNYK']} |",
-            f"| Build Docker Image | {os.environ['RESULT_BUILD']} |",
-            f"| Container Scan (Trivy) | {os.environ['RESULT_TRIVY']} |",
+            "## Phase 1 — Pre-Build Security\n",
+            "| Check | Tool | Status |",
+            "|-------|------|--------|",
+            f"| Secrets Detection | GitLeaks | {e['R_SECRETS']} |",
+            f"| Unit Tests | Mocha/nyc | {e['R_TEST']} |",
+            f"| SAST | Semgrep | {e['R_SEMGREP']} |",
+            f"| SAST | CodeQL | {e['R_CODEQL']} |",
+            f"| Dependency Scan | Snyk | {e['R_SNYK']} |",
+            f"| Dependency Scan | OWASP DC | {e['R_OWASP']} |",
+            f"| IaC Scan | Checkov | {e['R_CHECKOV']} |",
+            "\n## Phase 2 — Build\n",
+            "| Check | Tool | Status |",
+            "|-------|------|--------|",
+            f"| Docker Image Build | Docker | {e['R_BUILD']} |",
+            "\n## Phase 3 — Post-Build Security\n",
+            "| Check | Tool | Status |",
+            "|-------|------|--------|",
+            f"| Image Lint | Dockle | {e['R_DOCKLE']} |",
+            f"| Container Scan | Trivy | {e['R_TRIVY']} |",
+            f"| DAST | OWASP ZAP | {e['R_ZAP']} |",
             "\n---\n",
-            "## Snyk Dependency Findings\n",
+            "## Snyk Findings\n",
           ]
 
-          snyk_path = "reports/snyk-report.json"
-          if os.path.exists(snyk_path):
-            with open(snyk_path) as f:
-              data = json.load(f)
+          def load_json(path):
+            if os.path.exists(path):
+              with open(path) as f:
+                return json.load(f)
+            return None
+
+          data = load_json("reports/snyk-report.json")
+          if data:
             vulns = data.get("vulnerabilities", [])
-            lines.append(f"Total vulnerabilities: {len(vulns)}\n")
+            lines.append(f"Total: {len(vulns)}\n")
             for v in vulns[:20]:
               lines.append(f"- [{v.get('severity','').upper()}] {v.get('title','')} ({v.get('packageName','')}@{v.get('version','')})")
           else:
-            lines.append("_Snyk report not available._")
+            lines.append("_Not available._")
+
+          lines += ["\n---\n", "## OWASP Dependency-Check Findings\n"]
+          data = load_json("reports/dependency-check-report.json")
+          if data:
+            deps = [d for d in data.get("dependencies", []) if d.get("vulnerabilities")]
+            total = sum(len(d.get("vulnerabilities", [])) for d in deps)
+            lines.append(f"Total: {total}\n")
+            for d in deps[:20]:
+              for v in d.get("vulnerabilities", [])[:3]:
+                lines.append(f"- [{v.get('severity','')}] {v.get('name','')} in {d.get('fileName','')}")
+          else:
+            lines.append("_Not available._")
+
+          lines += ["\n---\n", "## Checkov IaC Findings\n"]
+          data = load_json("reports/checkov-report.json")
+          if data:
+            results = data.get("results", {})
+            failed = results.get("failed_checks", [])
+            passed = results.get("passed_checks", [])
+            lines.append(f"Passed: {len(passed)} | Failed: {len(failed)}\n")
+            for c in failed[:20]:
+              lines.append(f"- [{c.get('check_id','')}] {c.get('check_type','')} ({c.get('repo_file_path','')})")
+          else:
+            lines.append("_Not available._")
 
           lines += ["\n---\n", "## Trivy Container Findings\n"]
-
-          trivy_path = "reports/trivy-report.json"
-          if os.path.exists(trivy_path):
-            with open(trivy_path) as f:
-              data = json.load(f)
+          data = load_json("reports/trivy-report.json")
+          if data:
             results = data.get("Results", [])
             total = sum(len(r.get("Vulnerabilities") or []) for r in results)
-            lines.append(f"Total vulnerabilities: {total}\n")
+            lines.append(f"Total: {total}\n")
             for r in results:
               for v in (r.get("Vulnerabilities") or [])[:20]:
                 lines.append(f"- [{v.get('Severity','')}] {v.get('VulnerabilityID','')} in {v.get('PkgName','')}@{v.get('InstalledVersion','')}")
           else:
-            lines.append("_Trivy report not available._")
+            lines.append("_Not available._")
+
+          lines += ["\n---\n", "## Dockle Image Lint Findings\n"]
+          data = load_json("reports/dockle-report.json")
+          if data:
+            details = data.get("details", [])
+            lines.append(f"Total: {len(details)}\n")
+            for d in details[:20]:
+              lines.append(f"- [{d.get('level','')}] {d.get('code','')} - {d.get('title','')}")
+          else:
+            lines.append("_Not available._")
 
           os.makedirs("reports", exist_ok=True)
           with open("reports/security-report.md", "w") as f:
