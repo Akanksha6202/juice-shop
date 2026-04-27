@@ -349,7 +349,7 @@ jobs:
         continue-on-error: true
         with:
           name: owasp-report
-          path: reports/
+          path: reports/owasp/
 
       - name: Download Checkov report
         uses: actions/download-artifact@v4
@@ -428,9 +428,18 @@ jobs:
             "## Snyk Findings\n",
           ]
 
+          import glob
+
           def load_json(path):
             if os.path.exists(path):
               with open(path) as f:
+                return json.load(f)
+            return None
+
+          def find_json(pattern):
+            matches = glob.glob(pattern, recursive=True)
+            if matches:
+              with open(matches[0]) as f:
                 return json.load(f)
             return None
 
@@ -444,7 +453,7 @@ jobs:
             lines.append("_Not available._")
 
           lines += ["\n---\n", "## OWASP Dependency-Check Findings\n"]
-          data = load_json("reports/dependency-check-report.json")
+          data = find_json("reports/owasp/**/dependency-check-report.json")
           if data:
             deps = [d for d in data.get("dependencies", []) if d.get("vulnerabilities")]
             total = sum(len(d.get("vulnerabilities", [])) for d in deps)
@@ -456,7 +465,7 @@ jobs:
             lines.append("_Not available._")
 
           lines += ["\n---\n", "## Checkov IaC Findings\n"]
-          data = load_json("reports/checkov/checkov-report.json")
+          data = find_json("reports/checkov/**/checkov-report.json")
           if data:
             # Checkov outputs a list when multiple frameworks run, or a single dict
             entries = data if isinstance(data, list) else [data]
